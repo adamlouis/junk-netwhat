@@ -1,0 +1,10 @@
+[package]
+name = "netwhat"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.102"
+tokio = { version = "1.51.0", features = ["full"] }
+network-interface = { git = "https://github.com/oxidecomputer/network-interface", branch = "illumos", version = "0.1.7" }
+getopts = "0.2.24"
