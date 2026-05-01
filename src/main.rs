@@ -3,12 +3,24 @@ use network_interface::NetworkInterfaceConfig as _;
 use std::{
     net::{Ipv6Addr, SocketAddrV6},
     str::FromStr,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt as _, Interest},
     net::TcpStream,
 };
+
+fn now_str() -> String {
+    let d = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = d.as_secs();
+    let millis = d.subsec_millis();
+    let h = (secs / 3600) % 24;
+    let m = (secs / 60) % 60;
+    let s = secs % 60;
+    format!("{h:02}:{m:02}:{s:02}.{millis:03}")
+}
 
 fn name_to_scope(name: &str) -> Result<u32> {
     let ifs = network_interface::NetworkInterface::show()?;
@@ -216,21 +228,24 @@ async fn connect_one(
 ) -> Result<()> {
     let ca = SocketAddrV6::new(ip, port, 0, scope);
 
-    println!("{id}: connecting to {ca} via {}...", scope_to_name(scope));
+    println!("{id}: [{}] connecting to {ca} via {}...", now_str(), scope_to_name(scope));
 
     let start = Instant::now();
-    let mut conn = tokio::net::TcpStream::connect(ca).await?;
+    let conn = tokio::net::TcpStream::connect(ca).await?;
     let dur = Instant::now().duration_since(start);
-    println!("{id}: connected after {} msec", dur.as_millis());
+    println!("{id}: [{}] connected after {} msec", now_str(), dur.as_millis());
 
-    let mut outstanding = None;
+    let mut outstanding: Option<(Instant, String)> = None;
     let mut deadline =
         Instant::now().checked_add(Duration::from_secs(5)).unwrap();
-    let mut zeroes = 0;
+    let mut zeroes = 0u64;
+    let mut total_sent = 0u64;
+    let mut slow_count = 0u64;
+    let mut max_rtt_ms = 0u128;
 
     conn.set_nodelay(true)?;
 
-    loop {
+    let result = 'outer: loop {
         let mut interest = Interest::READABLE;
         if outstanding.is_none() {
             interest |= Interest::WRITABLE;
@@ -241,7 +256,7 @@ async fn connect_one(
         let res = match tokio::time::timeout_at(deadline.into(), fut).await {
             Ok(res) => res,
             Err(e) => {
-                bail!("I/O timed out: {e}");
+                break 'outer Err(anyhow::anyhow!("I/O timed out: {e}"));
             }
         };
 
@@ -250,14 +265,18 @@ async fn connect_one(
                 if outstanding.is_none() && interest.is_writable() {
                     match conn.try_write(b"A") {
                         Ok(_) => {
-                            outstanding = Some(Instant::now());
+                            let ts = now_str();
+                            outstanding = Some((Instant::now(), ts));
+                            total_sent += 1;
                         }
                         Err(e)
                             if e.kind() == std::io::ErrorKind::WouldBlock =>
                         {
                             ()
                         }
-                        Err(e) => bail!("write error: {e}"),
+                        Err(e) => {
+                            break 'outer Err(anyhow::anyhow!("write error: {e}"));
+                        }
                     }
                 }
 
@@ -266,21 +285,32 @@ async fn connect_one(
 
                     match conn.try_read(&mut buf) {
                         Ok(0) => {
-                            println!("{id}: EOF on read");
-                            return Ok(());
+                            println!("{id}: [{}] EOF on read", now_str());
+                            break 'outer Ok(());
                         }
                         Ok(1) => {
                             if buf[0] == b'A' {
-                                if let Some(sent) = outstanding.take() {
+                                if let Some((sent, send_ts)) = outstanding.take() {
                                     let msec = Instant::now()
                                         .saturating_duration_since(sent)
                                         .as_millis();
                                     if msec == 0 {
                                         zeroes += 1;
+                                        if zeroes % 50 == 0 {
+                                            println!(
+                                                "{id}: [{}] [ok {zeroes}]",
+                                                now_str(),
+                                            );
+                                        }
                                     } else {
+                                        slow_count += 1;
+                                        if msec > max_rtt_ms {
+                                            max_rtt_ms = msec;
+                                        }
                                         println!(
-                                            "{id}: rtt {msec} msec \
-                                            (after {zeroes} zeroes)"
+                                            "{id}: [{}] rtt {msec} msec \
+                                            (sent {send_ts}, after {zeroes} under 1ms)",
+                                            now_str(),
                                         );
                                         zeroes = 0;
                                     }
@@ -293,29 +323,47 @@ async fn connect_one(
                                         .checked_add(Duration::from_secs(5))
                                         .unwrap();
                                 } else {
-                                    bail!("did not expect reply traffic");
+                                    break 'outer Err(anyhow::anyhow!(
+                                        "did not expect reply traffic"
+                                    ));
                                 }
                             } else {
-                                bail!("incorrect reply traffic");
+                                break 'outer Err(anyhow::anyhow!(
+                                    "incorrect reply traffic"
+                                ));
                             }
                         }
                         Ok(sz) => {
-                            bail!("unexpected read of {sz} bytes");
+                            break 'outer Err(anyhow::anyhow!(
+                                "unexpected read of {sz} bytes"
+                            ));
                         }
                         Err(e)
                             if e.kind() == std::io::ErrorKind::WouldBlock =>
                         {
                             ()
                         }
-                        Err(e) => bail!("read error: {e}"),
+                        Err(e) => {
+                            break 'outer Err(anyhow::anyhow!("read error: {e}"));
+                        }
                     };
                 }
 
                 if r.is_error() {
-                    bail!("error on connection");
+                    break 'outer Err(anyhow::anyhow!("error on connection"));
                 }
             }
-            Err(e) => bail!("error on connection: {e}"),
+            Err(e) => {
+                break 'outer Err(anyhow::anyhow!("error on connection: {e}"));
+            }
         }
-    }
+    };
+
+    println!(
+        "{id}: [{}] stats: sent {total_sent}, slow {slow_count}, \
+        max_rtt {max_rtt_ms} msec",
+        now_str(),
+    );
+
+    result
 }
